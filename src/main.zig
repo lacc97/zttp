@@ -1,8 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const xev = @import("xev");
 
+const Buffer = @import("./buffer.zig").Buffer;
+const BufferPool = @import("./buffer.zig").BufferPool;
+
 const log = std.log;
+
+pub const std_options: std.Options = .{
+    .log_level = if (builtin.mode == .Debug) .debug else .info,
+};
 
 const use_gpa = false;
 
@@ -20,7 +28,7 @@ pub fn main() !void {
     var loop = try xev.Loop.init(.{ .thread_pool = if (thread_pool) |*tp| tp else null });
     defer loop.deinit();
 
-    var server = Server{ .gpa = gpa };
+    var server = try Server.init(gpa);
     defer server.deinit();
 
     const accept_address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080);
@@ -31,11 +39,15 @@ pub fn main() !void {
     var accept_completion: xev.Completion = undefined;
     accept_socket.accept(&loop, &accept_completion, Server, &server, onAccept);
 
+    log.info("listening on {}", .{accept_address});
     try loop.run(.until_done);
 }
 
 const Server = struct {
     gpa: std.mem.Allocator,
+
+    buffer_pool: BufferPool,
+    connection_pool: std.heap.MemoryPool(Connection),
 
     const Connection = struct {
         gpa: std.mem.Allocator,
@@ -45,10 +57,43 @@ const Server = struct {
         read_completion: xev.Completion = undefined,
         write_completion: xev.Completion = undefined,
         close_completion: xev.Completion = undefined,
+
+        fn create(server: *Server, socket: xev.TCP) error{OutOfMemory}!*Connection {
+            const conn = try server.connection_pool.create();
+            errdefer server.connection_pool.destroy(conn);
+
+            conn.* = .{
+                .gpa = server.gpa,
+                .server = server,
+                .socket = socket,
+            };
+
+            return conn;
+        }
+
+        fn destroy(conn: *Connection) void {
+            conn.server.connection_pool.destroy(conn);
+        }
+
+        fn allocBuffer(conn: *Connection, min_size: usize) error{OutOfMemory}!Buffer {
+            return conn.server.buffer_pool.alloc(min_size);
+        }
+        fn freeBuffer(conn: *Connection, buf: Buffer) void {
+            return conn.server.buffer_pool.free(buf);
+        }
     };
 
+    fn init(gpa: std.mem.Allocator) !Server {
+        return .{
+            .gpa = gpa,
+            .buffer_pool = try BufferPool.init(gpa, .{ .max_size_bits = 20 }),
+            .connection_pool = std.heap.MemoryPool(Connection).init(gpa),
+        };
+    }
+
     fn deinit(server: *Server) void {
-        _ = server; // autofix
+        server.connection_pool.deinit();
+        server.buffer_pool.deinit();
     }
 };
 
@@ -64,19 +109,18 @@ fn onAccept(
         log.err("accept: {any}", .{err});
         return .disarm;
     };
-    const conn = server.gpa.create(Server.Connection) catch {
+    const conn = Server.Connection.create(server, socket) catch {
         log.err("accept: out of memory", .{});
         std.os.close(socket.fd);
         return .rearm;
     };
-    conn.* = .{ .gpa = server.gpa, .server = server, .socket = socket };
-    const read_buffer = conn.gpa.alloc(u8, 1024) catch {
+    const buf = conn.allocBuffer(2048) catch {
         log.err("accept: out of memory", .{});
-        server.gpa.destroy(conn);
+        conn.destroy();
         std.os.close(socket.fd);
         return .rearm;
     };
-    conn.socket.read(l, &conn.read_completion, .{ .slice = read_buffer }, Server.Connection, conn, connRead);
+    conn.socket.read(l, &conn.read_completion, buf.intoReadBuffer(), Server.Connection, conn, connRead);
     log.debug("accepted", .{});
     return .rearm;
 }
@@ -92,24 +136,20 @@ fn connRead(
     _ = c; // autofix
     _ = s; // autofix
     const conn = ud.?;
-    defer conn.gpa.free(b.slice);
+    const buf = Buffer.fromReadBuffer(b);
 
     const read_size = r catch |err| {
         log.err("read: {any}", .{err});
+        conn.freeBuffer(buf);
         conn.socket.close(l, &conn.close_completion, Server.Connection, conn, connClose);
         return .disarm;
     };
 
     log.debug("recv: {s}", .{b.slice[0..read_size]});
 
-    const buf =
-        conn.gpa.alloc(u8, 1024) catch {
-        log.err("read: out of memory for response", .{});
-        return .disarm;
-    };
     const response = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
-    @memcpy(buf[0..response.len], response);
-    conn.socket.write(l, &conn.write_completion, .{ .slice = buf }, Server.Connection, conn, connWrite);
+    @memcpy(buf.slice()[0..response.len], response);
+    conn.socket.write(l, &conn.write_completion, buf.intoWriteBuffer(), Server.Connection, conn, connWrite);
 
     return .disarm;
 }
@@ -125,7 +165,8 @@ fn connWrite(
     _ = c; // autofix
     _ = s; // autofix
     const conn = ud.?;
-    defer conn.gpa.free(b.slice);
+    const buf = Buffer.fromWriteBuffer(b);
+    defer conn.freeBuffer(buf);
 
     // TODO: handle partial writes?
     const write_size = r catch |err| {
@@ -154,9 +195,13 @@ fn connClose(
     _ = s; // autofix
 
     const conn = ud.?;
-    defer conn.server.gpa.destroy(conn);
+    defer conn.destroy();
 
     r catch |err| log.err("close: {any}", .{err});
 
     return .disarm;
+}
+
+test {
+    _ = @import("./buffer.zig");
 }

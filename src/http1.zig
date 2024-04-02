@@ -138,7 +138,6 @@ pub const Request = struct {
             _ = p.advance(2);
 
             p.req.headers.append(.{ .name = name, .value = value }) catch return error.TooManyHeaders;
-            std.debug.print("{s}\n", .{p.data[p.curr..]});
             return true;
         }
 
@@ -166,6 +165,44 @@ pub const Request = struct {
             return std.ascii.isAlphabetic(ch) or ch == '-';
         }
     };
+
+    test parse {
+        const cases = blk: {
+            const tc = @import("test-cases").http1;
+            break :blk [_]tc.Request{tc.request_ziglang_docs};
+        };
+
+        for (cases) |case| {
+            const CaseHeader = @typeInfo(@TypeOf(case.headers)).Pointer.child;
+
+            const buf = try testing.allocator.dupe(u8, case.bytes);
+            defer testing.allocator.free(buf);
+
+            var req: Request = undefined;
+
+            const consumed = try req.parse(buf);
+            try testing.expectEqual(@as(usize, case.bytes.len), consumed);
+
+            try testing.expectEqualStrings(case.method, req.method);
+            try testing.expectEqualStrings(case.path, req.path);
+
+            const headers = try testing.allocator.alloc(CaseHeader, req.headers.slice().len);
+            defer testing.allocator.free(headers);
+
+            for (headers, req.headers.slice()) |*h, rh| h.* = .{ .name = rh.name, .value = rh.value };
+            std.sort.pdq(CaseHeader, headers, CaseHeader.SortContext{}, CaseHeader.SortContext.lessThan);
+
+            for (0..@max(headers.len, case.headers.len)) |i| {
+                const name_expected = if (case.headers.len > i) case.headers[i].name else "";
+                const value_expected = if (case.headers.len > i) case.headers[i].value else "";
+                const name_got = if (headers.len > i) headers[i].name else "";
+                const value_got = if (headers.len > i) headers[i].value else "";
+
+                try testing.expectEqualStrings(name_expected, name_got);
+                try testing.expectEqualStrings(value_expected, value_got);
+            }
+        }
+    }
 };
 
 pub const Field = struct {
@@ -289,19 +326,6 @@ pub fn Buffer(comptime size: BufferSize, comptime IndexType: type) type {
     };
 }
 
-fn strbuf(comptime str: []const u8) [str.len]u8 {
-    var buf: [str.len]u8 = undefined;
-    @memcpy(&buf, str);
-    return buf;
-}
-
 test {
-    var buf = strbuf("GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
-
-    var req: Request = undefined;
-
-    const consumed = try req.parse(&buf);
-    try testing.expectEqual(@as(usize, buf.len), consumed);
-
-    std.debug.print("method: {s}, path: {s}, version: {s}, headers: {s}\n", .{ req.method, req.path, @tagName(req.version), req.headers.slice() });
+    _ = Request;
 }

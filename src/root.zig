@@ -182,3 +182,7 @@ pub fn Server(comptime cfg: Config) type {
         }
     };
 }
+
+test {
+    _ = @import("http1.zig");
+}

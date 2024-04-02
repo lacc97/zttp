@@ -4,8 +4,8 @@
     .paths = .{ "build.zig", "build.zig.zon", "src" },
     .dependencies = .{
         .libxev = .{
-            .url = "git+https://github.com/mitchellh/libxev.git#418cac65473668b02cc5a85194042bdaf04acd00",
-            .hash = "12203116ff408eb48f81c947dfeb06f7feebf6a9efa962a560ac69463098b2c04a96",
+            .url = "git+https://github.com/mitchellh/libxev.git#0f73adfda1cff9c740160717b5431ebada6b8755",
+            .hash = "12203dcbe098ee49ea242432cd198b1ca557626988f056bea86630dcfe8660244407",
         },
     },
 }

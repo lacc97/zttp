@@ -169,7 +169,7 @@ pub const Request = struct {
     test parse {
         const cases = blk: {
             const tc = @import("test-cases").http1;
-            break :blk [_]tc.Request{tc.request_ziglang_docs};
+            break :blk [_]tc.Request{ tc.request_simple, tc.request_ziglang_docs };
         };
 
         for (cases) |case| {

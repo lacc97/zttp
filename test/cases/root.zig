@@ -32,6 +32,16 @@ pub const http1 = struct {
         };
     };
 
+    pub const request_simple: Request = .{
+        .bytes = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n",
+
+        .method = "GET",
+        .path = "/",
+        .headers = Request.Header.sorted(&.{
+            .{ .name = "connection", .value = "close" },
+        }),
+    };
+
     pub const request_ziglang_docs: Request = .{
         .bytes = @embedFile("req_ziglang_docs.txt"),
 

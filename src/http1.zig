@@ -62,10 +62,16 @@ test parseRequestLineAndHeaders {
         try testing.expectEqualStrings(case.method, req.method);
         try testing.expectEqualStrings(case.path, req.path);
 
-        const headers = try testing.allocator.alloc(CaseHeader, req.headers.slice().len);
+        const headers = try testing.allocator.alloc(CaseHeader, req.headers.len());
         defer testing.allocator.free(headers);
 
-        for (headers, req.headers.slice()) |*h, rh| h.* = .{ .name = rh.name, .value = rh.value };
+        {
+            var i: usize = 0;
+            var it = req.headers.iterator();
+            while (it.next()) |hdr| : (i += 1) headers[i] = .{ .name = hdr.name, .value = hdr.value };
+            try testing.expectEqual(headers.len, i);
+        }
+
         std.sort.pdq(CaseHeader, headers, CaseHeader.SortContext{}, CaseHeader.SortContext.lessThan);
 
         for (0..@max(headers.len, case.headers.len)) |i| {
@@ -148,7 +154,7 @@ const RequestParser = struct {
         if (p.data[p.curr] != '\r' or p.data[p.curr + 1] != '\n') return error.InvalidToken;
         _ = p.advance(2);
 
-        p.req.headers.append(.{ .name = name, .value = value }) catch return error.TooManyHeaders;
+        p.req.headers.add(name, value) catch return error.TooManyHeaders;
         return true;
     }
 

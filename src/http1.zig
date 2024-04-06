@@ -11,16 +11,31 @@ pub fn StateMachine(
     comptime on_request: anytype,
     comptime on_data: anytype,
 ) type {
-    return struct {
-        inner: union(enum) {
-            headers,
-            body: Chunk,
-            body_chunked: ?Chunk,
-        } = .headers,
-        context: Context = undefined,
+    const onRequest = struct {
+        fn onRequest(ctx: Context, req: Request) !void {
+            // TODO: check function, handle errors
+            return @call(.always_inline, on_request, .{ ctx, req });
+        }
+    }.onRequest;
 
-        pub fn process(sm: *@This(), data: []u8) !usize {
-            return switch (sm.inner) {
+    const onData = struct {
+        fn onData(ctx: Context, data: error{Closed}![]u8) !void {
+            // TODO: check function, handle errors
+            return @call(.always_inline, on_data, .{ ctx, data });
+        }
+    }.onData;
+
+    return union(enum) {
+        headers,
+        body: Chunk,
+        body_chunked: ?Chunk,
+
+        pub fn init() @This() {
+            return .headers;
+        }
+
+        pub fn process(sm: *@This(), ctx: Context, data: []u8) !usize {
+            return switch (sm.*) {
                 .headers => blk_headers: {
                     var req: Request = undefined;
                     const consumed = try parseRequestLineAndHeaders(&req, data);
@@ -39,24 +54,24 @@ pub fn StateMachine(
                         if (te != .chunked) {
                             return error.UnsupportedCoding;
                         }
-                        sm.inner = .{ .body_chunked = null };
+                        sm.* = .{ .body_chunked = null };
                     } else {
                         const length = if (content_length) |ce| ce else 0;
 
                         // If the length is zero, the message has no body and would be
                         // immediately followed by another request (if any).
                         if (length != 0) {
-                            sm.inner = .{ .body = .{ .cur = 0, .len = length } };
+                            sm.* = .{ .body = .{ .cur = 0, .len = length } };
                         }
                     }
-                    try sm.onRequest(req);
+                    try onRequest(ctx, req);
                     break :blk_headers consumed;
                 },
                 .body => |*body| blk_body: {
                     const consumed = @min(@as(u64, data.len), body.len - body.cur);
                     body.cur += consumed;
-                    if (body.cur == body.len) sm.inner = .headers;
-                    try sm.onData(data[0..consumed]);
+                    if (body.cur == body.len) sm.* = .headers;
+                    try onData(ctx, data[0..consumed]);
                     break :blk_body consumed;
                 },
                 .body_chunked => |*body| {
@@ -64,15 +79,6 @@ pub fn StateMachine(
                     @panic("TODO: RFC9112 section 7.1");
                 },
             };
-        }
-
-        fn onRequest(sm: *@This(), req: Request) !void {
-            // TODO: check function, handle errors
-            return @call(.always_inline, on_request, .{ &sm.context, req });
-        }
-        fn onData(sm: *@This(), data: error{Closed}![]u8) !void {
-            // TODO: check function, handle errors
-            return @call(.always_inline, on_data, .{ &sm.context, data });
         }
     };
 }
@@ -127,7 +133,7 @@ test StateMachine {
         };
 
         const SM = StateMachine(
-            Context,
+            *Context,
             Context.onRequest,
             Context.onData,
         );
@@ -135,11 +141,12 @@ test StateMachine {
         const buf = try testing.allocator.dupe(u8, case.bytes);
         defer testing.allocator.free(buf);
 
-        var sm: SM = .{ .context = .{ .case = case } };
+        var sm = SM.init();
+        var sm_context: Context = .{ .case = case };
 
-        try testing.expectError(error.NeedMore, sm.process(buf[0 .. buf.len / 2]));
-        try testing.expectEqual(@as(usize, buf.len), sm.process(buf));
-        try testing.expect(sm.context.request_received);
+        try testing.expectError(error.NeedMore, sm.process(&sm_context, buf[0 .. buf.len / 2]));
+        try testing.expectEqual(@as(usize, buf.len), sm.process(&sm_context, buf));
+        try testing.expect(sm_context.request_received);
     }
 }
 

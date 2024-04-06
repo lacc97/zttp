@@ -14,6 +14,13 @@ headers: HeaderMap,
 
 pub const Header = struct { name: []const u8, value: []const u8 };
 
+pub fn dump(req: Request, writer: anytype) !void {
+    try writer.print("{s} {s} HTTP/{s}\n", .{ req.method, req.path, @tagName(req.version) });
+    var it = req.headers.iterator();
+    while (it.next()) |h| try writer.print("{s}: {s}\n", .{ h.name, h.value });
+    try writer.writeByte('\n');
+}
+
 pub const HeaderMap = struct {
     trie: Index = .empty,
     trie_storage: std.BoundedArray(Entry, constants.http1_headers_count_max) = .{},

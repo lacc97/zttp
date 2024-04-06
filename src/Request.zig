@@ -6,8 +6,8 @@ const constants = @import("constants.zig");
 
 const Request = @This();
 
-method: []u8,
-path: []u8,
+method: []const u8,
+path: []const u8,
 version: enum { @"1.1" },
 
 headers: HeaderMap,

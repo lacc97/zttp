@@ -3,6 +3,10 @@ const assert = std.debug.assert;
 
 const zttp = @This();
 
+const Request = @import("Request.zig");
+
+const Http1StateMachine = @import("http1.zig").StateMachine;
+
 pub const Config = struct {
     xev: type,
     log: ?type = null,
@@ -86,16 +90,11 @@ pub fn Server(comptime cfg: Config) type {
             const node: *ConnectionNode = try srv.connection_pool.create();
             errdefer srv.connection_pool.destroy(node);
 
-            const conn = &node.data;
-            conn.* = .{
-                .srv = srv,
-                .sock = sock,
-            };
-
             srv.connection_list.append(node);
             errdefer srv.connection_list.remove(node);
 
-            conn.sock.read(loop, &conn.comp, .{ .slice = &conn.buffer }, Connection, conn, connRead);
+            const conn = &node.data;
+            conn.init(loop, srv, sock);
         }
 
         fn destroyConn(srv: *ZttpServer, conn: *Connection) void {
@@ -111,75 +110,105 @@ pub fn Server(comptime cfg: Config) type {
             sock: xev.TCP,
             comp: xev.Completion = undefined,
 
-            buffer: [8192]u8 = undefined,
+            state_machine: Http1 = Http1.init(),
+            buffer: std.BoundedArray(u8, 8192) = .{},
+
+            pub fn init(conn: *Connection, loop: *xev.Loop, srv: *ZttpServer, sock: xev.TCP) void {
+                conn.* = .{
+                    .srv = srv,
+                    .sock = sock,
+                };
+
+                conn.readAppend(loop) catch unreachable; // not possible because we just initialised this object
+            }
+
+            fn readAppend(conn: *Connection, loop: *xev.Loop) error{OutOfSpace}!void {
+                if (conn.buffer.unusedCapacitySlice().len == 0) return error.OutOfSpace;
+
+                conn.sock.read(loop, &conn.comp, .{ .slice = conn.buffer.unusedCapacitySlice() }, Connection, conn, onRead);
+            }
+
+            fn close(conn: *Connection, loop: *xev.Loop) void {
+                conn.sock.close(loop, &conn.comp, Connection, conn, onClose);
+            }
+
+            fn onRead(
+                arg_conn: ?*Connection,
+                loop: *xev.Loop,
+                _: *xev.Completion,
+                _: xev.TCP,
+                _: xev.ReadBuffer,
+                result: xev.ReadError!usize,
+            ) xev.CallbackAction {
+                const conn = arg_conn.?;
+
+                const len = result catch |err| {
+                    log.err("read: {any}", .{err});
+                    conn.close(loop);
+                    return .disarm;
+                };
+                conn.buffer.resize(conn.buffer.len + len) catch unreachable;
+
+                const processed = conn.state_machine.process(conn, conn.buffer.slice()) catch |err| switch (err) {
+                    else => @panic("TODO: error handling"),
+                };
+                assert(processed == conn.buffer.len);
+                conn.buffer.resize(0) catch unreachable;
+
+                const response = "HTTP/1.1 204 No Content\r\n\r\n";
+                conn.sock.write(loop, &conn.comp, .{ .slice = response }, Connection, conn, onWrite);
+
+                return .disarm;
+            }
+
+            fn onClose(
+                arg_conn: ?*Connection,
+                _: *xev.Loop,
+                _: *xev.Completion,
+                _: xev.TCP,
+                r: xev.CloseError!void,
+            ) xev.CallbackAction {
+                const conn = arg_conn.?;
+                defer conn.srv.destroyConn(conn);
+                r catch |err| log.err("close: {any}", .{err});
+                return .disarm;
+            }
+
+            fn onWrite(
+                arg_conn: ?*Connection,
+                loop: *xev.Loop,
+                _: *xev.Completion,
+                _: xev.TCP,
+                _: xev.WriteBuffer,
+                r: xev.WriteError!usize,
+            ) xev.CallbackAction {
+                const conn = arg_conn.?;
+                _ = r catch |err| {
+                    log.err("write: {any}", .{err});
+                    conn.close(loop);
+                    return .disarm;
+                };
+                // TODO: this
+                conn.readAppend(loop) catch unreachable;
+                return .disarm;
+            }
+
+            const Http1 = Http1StateMachine(*Connection, Connection.onRequest, Connection.onData);
+
+            fn onRequest(conn: *Connection, req: Request) !void {
+                _ = conn;
+                _ = req;
+                // var buffer = std.io.bufferedWriter(std.io.getStdErr().writer());
+                // defer buffer.flush() catch {};
+                // req.dump(buffer.writer()) catch {};
+            }
+
+            fn onData(conn: *Connection, data: error{Closed}![]u8) !void {
+                _ = conn;
+                _ = data catch {};
+            }
         };
         const ConnectionNode = std.DoublyLinkedList(Connection).Node;
-
-        fn connRead(
-            arg_conn: ?*Connection,
-            loop: *xev.Loop,
-            comp: *xev.Completion,
-            _: xev.TCP,
-            buffer: xev.ReadBuffer,
-            result: xev.ReadError!usize,
-        ) xev.CallbackAction {
-            _ = buffer; // autofix
-            const conn = arg_conn.?;
-
-            const read_size = result catch |err| {
-                log.err("read: {any}", .{err});
-                conn.sock.close(loop, comp, Connection, conn, connClose);
-                return .disarm;
-            };
-            _ = read_size; // autofix
-
-            const response = "HTTP/1.1 204 No Content\r\n\r\n";
-            @memcpy(conn.buffer[0..response.len], response);
-            conn.sock.write(loop, comp, .{ .slice = conn.buffer[0..response.len] }, Connection, conn, connWrite);
-
-            return .disarm;
-        }
-
-        fn connWrite(
-            arg_conn: ?*Connection,
-            loop: *xev.Loop,
-            comp: *xev.Completion,
-            _: xev.TCP,
-            buffer: xev.WriteBuffer,
-            r: xev.WriteError!usize,
-        ) xev.CallbackAction {
-            _ = buffer; // autofix
-            const conn = arg_conn.?;
-
-            // TODO: handle partial writes?
-            const write_size = r catch |err| {
-                log.err("write: {any}", .{err});
-                conn.sock.close(loop, comp, Connection, conn, connClose);
-                return .disarm;
-            };
-            _ = write_size; // autofix
-
-            conn.sock.read(loop, &conn.comp, .{ .slice = &conn.buffer }, Connection, conn, connRead);
-
-            return .disarm;
-        }
-
-        fn connClose(
-            arg_conn: ?*Connection,
-            loop: *xev.Loop,
-            comp: *xev.Completion,
-            _: xev.TCP,
-            r: xev.CloseError!void,
-        ) xev.CallbackAction {
-            _ = loop; // autofix
-            _ = comp; // autofix
-            const conn = arg_conn.?;
-            defer conn.srv.destroyConn(conn);
-
-            r catch |err| log.err("close: {any}", .{err});
-
-            return .disarm;
-        }
     };
 }
 

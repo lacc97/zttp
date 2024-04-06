@@ -12,19 +12,84 @@ pub const StateMachine = union(enum) {
         cur: u64 = 0,
         len: u64,
     },
-    body_chunked,
+    body_chunked: struct { chunk: ?struct {} },
 
     pub fn process(sm: *StateMachine, data: []u8) !usize {
         return switch (sm.*) {
             .headers => blk_headers: {
                 var req: Request = undefined;
                 const consumed = try parseRequestLineAndHeaders(&req, data);
-                req.getHeadersByName();
+
+                const transfer_encoding = getTransferEncoding(&req.headers) catch {
+                    return error.InvalidFraming;
+                };
+                const content_length = getContentLength(&req.headers) catch {
+                    return error.InvalidFraming;
+                };
+
+                if (transfer_encoding) |te| {
+                    if (content_length != null) {
+                        return error.InvalidFraming;
+                    }
+                    if (te != .chunked) {
+                        return error.UnsupportedCoding;
+                    }
+                    sm.* = .{ .body_chunked = .{ .chunk = null } };
+                } else {
+                    const length = if (content_length) |ce| ce else 0;
+
+                    // If the length is zero, the message has no body and would be
+                    // immediately followed by another request (if any).
+                    if (length != 0) {
+                        sm.* = .{ .body = .{ .cur = 0, .len = length } };
+                    }
+                }
                 break :blk_headers consumed;
+            },
+            .body => |*body| blk_body: {
+                const consumed = @min(@as(u64, data.len), body.len - body.cur);
+                body.cur += consumed;
+                if (body.cur == body.len) sm.* = .headers;
+                break :blk_body consumed;
+            },
+            .body_chunked => |*body| {
+                _ = body;
+                @panic("TODO: RFC9112 section 7.1");
             },
         };
     }
+
+    test process {
+        for (test_cases_correct) |case| {
+            const buf = try testing.allocator.dupe(u8, case.bytes);
+            defer testing.allocator.free(buf);
+
+            var sm: StateMachine = .headers;
+
+            try testing.expectError(error.NeedMore, sm.process(buf[0 .. buf.len / 2]));
+            try testing.expectEqual(@as(usize, buf.len), sm.process(buf));
+        }
+    }
 };
+
+fn getTransferEncoding(hm: *const Request.HeaderMap) error{Invalid}!?TransferEncoding {
+    // TODO: get transfer-encoding stack and verify that the last coding is chunked (RFC9112 section 6.1)
+    const h = (hm.findSingle("transfer-encoding") catch return error.Invalid) orelse return null;
+    return if (std.mem.eql(u8, std.mem.trim(u8, h.value, " \t"), "chunked"))
+        .chunked
+    else
+        return error.Invalid;
+}
+
+const TransferEncoding = enum {
+    chunked,
+    // TODO: gzip?
+};
+
+fn getContentLength(hm: *const Request.HeaderMap) error{Invalid}!?u64 {
+    const h = (hm.findSingle("content-length") catch return error.Invalid) orelse return null;
+    return std.fmt.parseUnsigned(u64, h.value, 10) catch error.Invalid;
+}
 
 fn parseRequestLineAndHeaders(req: *Request, data: []u8) !usize {
     assert(data.len > 0);
@@ -43,12 +108,7 @@ fn parseRequestLineAndHeaders(req: *Request, data: []u8) !usize {
 }
 
 test parseRequestLineAndHeaders {
-    const cases = blk: {
-        const tc = @import("test-cases").http1;
-        break :blk [_]tc.Request{ tc.request_simple, tc.request_ziglang_docs };
-    };
-
-    for (cases) |case| {
+    for (test_cases_correct) |case| {
         const CaseHeader = @typeInfo(@TypeOf(case.headers)).Pointer.child;
 
         const buf = try testing.allocator.dupe(u8, case.bytes);
@@ -182,3 +242,12 @@ const RequestParser = struct {
         return std.ascii.isAlphabetic(ch) or ch == '-';
     }
 };
+
+const test_cases_correct = blk: {
+    const tc = @import("test-cases").http1;
+    break :blk [_]tc.Request{ tc.request_simple, tc.request_ziglang_docs };
+};
+
+test {
+    _ = StateMachine;
+}

@@ -15,7 +15,7 @@ pub const http1 = struct {
             fn sorted(comptime hdrs: []const Header) []const Header {
                 var hdrs_sorted_mut: [hdrs.len]Header = undefined;
                 @memcpy(&hdrs_sorted_mut, hdrs);
-                std.sort.pdq(Header, &hdrs_sorted_mut, SortContext{}, SortContext.lessThan);
+                std.sort.block(Header, &hdrs_sorted_mut, SortContext{}, SortContext.lessThan);
                 const hdrs_sorted = hdrs_sorted_mut;
                 return &hdrs_sorted;
             }

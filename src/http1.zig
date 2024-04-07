@@ -188,34 +188,34 @@ fn parseRequestLineAndHeaders(req: *Request, data: []u8) !usize {
 const RequestParser = struct {
     req: *Request,
     data: []u8,
-    curr: usize,
+    curr: u32,
 
     fn parseRequestLine(p: *RequestParser) !void {
         { // -- method
-            const sp_off = for (p.data[p.curr..], 0..) |ch, i| {
+            const sp_off: u32 = for (p.data[p.curr..], 0..) |ch, i| {
                 if (!isMethodChar(ch)) {
                     if (ch != ' ') return error.InvalidToken;
-                    break i;
+                    break @intCast(i);
                 }
             } else return error.NeedMore;
-            p.req.method = p.advance(sp_off + 1)[0..sp_off];
+            p.req._method = p.advanceByteSlice(sp_off + 1).sub(0, sp_off);
         }
 
         { // -- path
-            const sp_off = for (p.data[p.curr..], 0..) |ch, i| {
+            const sp_off: u32 = for (p.data[p.curr..], 0..) |ch, i| {
                 if (!isPathChar(ch)) {
                     if (ch != ' ') return error.InvalidToken;
-                    break i;
+                    break @intCast(i);
                 }
             } else return error.NeedMore;
-            p.req.path = p.advance(sp_off + 1)[0..sp_off];
+            p.req._path = p.advanceByteSlice(sp_off + 1).sub(0, sp_off);
         }
 
         { // -- version
             const version = "HTTP/1.1";
             if (p.remainingLen() < version.len + 2) return error.NeedMore;
             if (!std.mem.eql(u8, p.advance(version.len), version)) return error.InvalidVersion;
-            p.req.version = .@"1.1";
+            p.req._version = .@"1.1";
             if (!std.mem.eql(u8, p.advance(2), "\r\n")) return error.InvalidToken;
         }
     }
@@ -228,11 +228,11 @@ const RequestParser = struct {
         }
 
         const name = blk_name: {
-            const sep_off = for (p.data[p.curr..], 0..) |*ch, i| {
+            const sep_off: u32 = for (p.data[p.curr..], 0..) |*ch, i| {
                 ch.* = std.ascii.toLower(ch.*);
                 if (!isFieldNameChar(ch.*)) {
                     if (ch.* != ':') return error.InvalidToken;
-                    break i;
+                    break @intCast(i);
                 }
             } else return error.NeedMore;
             break :blk_name p.advance(sep_off + 1)[0..sep_off];
@@ -242,8 +242,8 @@ const RequestParser = struct {
             // Skip whitespace.
             while (p.curr < p.data.len and p.data[p.curr] == ' ') : (p.curr += 1) {}
 
-            const delim_off = for (p.data[p.curr..], 0..) |ch, i| {
-                if (ch == '\r') break i;
+            const delim_off: u32 = for (p.data[p.curr..], 0..) |ch, i| {
+                if (ch == '\r') break @intCast(i);
             } else return error.NeedMore;
 
             break :blk_value p.advance(delim_off);
@@ -257,10 +257,16 @@ const RequestParser = struct {
         return true;
     }
 
-    inline fn advance(p: *RequestParser, n: usize) []u8 {
+    inline fn advance(p: *RequestParser, n: u32) []u8 {
         assert(p.remainingLen() >= n);
         defer p.curr += n;
         return p.data[p.curr..][0..n];
+    }
+
+    inline fn advanceByteSlice(p: *RequestParser, n: u32) Request.ByteSlice {
+        assert(p.remainingLen() >= n);
+        defer p.curr += n;
+        return .{ .ptr = p.curr, .len = n };
     }
 
     inline fn remainingLen(p: *RequestParser) usize {

@@ -6,19 +6,46 @@ const constants = @import("constants.zig");
 
 const Request = @This();
 
-method: []const u8,
-path: []const u8,
-version: enum { @"1.1" },
+data: []const u8,
 
+_method: ByteSlice,
+_path: ByteSlice,
+_version: Version,
 headers: HeaderMap,
 
 pub const Header = struct { name: []const u8, value: []const u8 };
+pub const Version = enum { @"1.1" };
+
+pub const ByteSlice = struct {
+    ptr: u32,
+    len: u32,
+
+    pub inline fn sub(s: ByteSlice, idx: u32, len: u32) ByteSlice {
+        assert(idx <= s.len);
+        assert(len <= s.len - idx);
+        return .{ .ptr = s.ptr + idx, .len = len };
+    }
+};
+
+pub fn method(req: Request) []const u8 {
+    return req.slice(req._method);
+}
+pub fn path(req: Request) []const u8 {
+    return req.slice(req._path);
+}
+pub fn version(req: Request) Version {
+    return req._version;
+}
 
 pub fn dump(req: Request, writer: anytype) !void {
-    try writer.print("{s} {s} HTTP/{s}\n", .{ req.method, req.path, @tagName(req.version) });
+    try writer.print("{s} {s} HTTP/{s}\n", .{ req.method(), req.path(), @tagName(req.version) });
     var it = req.headers.iterator();
     while (it.next()) |h| try writer.print("{s}: {s}\n", .{ h.name, h.value });
     try writer.writeByte('\n');
+}
+
+inline fn slice(req: Request, s: ByteSlice) []const u8 {
+    return req.data[s.ptr..][0..s.len];
 }
 
 pub const HeaderMap = struct {

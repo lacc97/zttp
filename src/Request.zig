@@ -11,155 +11,82 @@ data: []const u8,
 _method: ByteSlice,
 _path: ByteSlice,
 _version: Version,
-headers: HeaderMap,
+_headers: StringKeyValue,
 
-pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Version = enum { @"1.1" };
 
-pub const ByteSlice = struct {
-    ptr: u32,
-    len: u32,
-
-    pub inline fn sub(s: ByteSlice, idx: u32, len: u32) ByteSlice {
-        assert(idx <= s.len);
-        assert(len <= s.len - idx);
-        return .{ .ptr = s.ptr + idx, .len = len };
-    }
-};
+pub const ByteSlice = @import("offset_pointer.zig").Slice(u8, u32, u32, .type);
 
 pub fn method(req: Request) []const u8 {
-    return req.slice(req._method);
+    return req._method.reifyConst(req.data);
 }
 pub fn path(req: Request) []const u8 {
-    return req.slice(req._path);
+    return req._path.reifyConst(req.data);
 }
 pub fn version(req: Request) Version {
     return req._version;
 }
+pub fn headers(req: Request) StringKeyValue.ReifyConst {
+    return req._headers.reifyConst(req.data);
+}
 
 pub fn dump(req: Request, writer: anytype) !void {
-    try writer.print("{s} {s} HTTP/{s}\n", .{ req.method(), req.path(), @tagName(req.version) });
-    var it = req.headers.iterator();
-    while (it.next()) |h| try writer.print("{s}: {s}\n", .{ h.name, h.value });
+    try writer.print("{s} {s} HTTP/{s}\n", .{ req.method(), req.path(), @tagName(req.version()) });
+    var it = req.headers().iterate();
+    while (it.next()) |h| try writer.print("{s}: {s}\n", .{ h.k, h.v });
     try writer.writeByte('\n');
 }
 
-inline fn slice(req: Request, s: ByteSlice) []const u8 {
-    return req.data[s.ptr..][0..s.len];
-}
+pub const StringKeyValue = struct {
+    buf: []Entry = &.{},
 
-pub const HeaderMap = struct {
-    trie: Index = .empty,
-    trie_storage: std.BoundedArray(Entry, constants.http1_headers_count_max) = .{},
+    pub const KV = struct { k: []const u8, v: []const u8 };
 
-    const Entry = struct {
-        child: [4]Index = [_]Index{.empty} ** 4,
-        header: Header,
+    pub const Entry = struct {
+        k: ByteSlice,
+        v: ByteSlice,
+
+        pub fn reifyConst(e: Entry, buffer: []const u8) KV {
+            return .{
+                .k = e.k.reifyConst(buffer),
+                .v = e.v.reifyConst(buffer),
+            };
+        }
     };
-    const Index = enum(u16) { empty = std.math.maxInt(u16), _ };
 
-    comptime {
-        assert(constants.http1_headers_count_max < @intFromEnum(Index.empty));
+    pub inline fn reifyConst(smap: StringKeyValue, data: []const u8) ReifyConst {
+        return .{ .smap = smap.buf, .data = data };
     }
 
-    pub fn len(hm: *const HeaderMap) u16 {
-        return @intCast(hm.trie_storage.len);
-    }
+    pub const ReifyConst = struct {
+        smap: []const Entry,
+        data: []const u8,
 
-    pub fn find(hm: *const HeaderMap, name: []const u8) ?Header {
-        var it = hm.findMany(name);
-        const header = it.next();
-        return header;
-    }
-
-    pub fn findSingle(hm: *const HeaderMap, name: []const u8) error{Duplicate}!?Header {
-        var it = hm.findMany(name);
-        const header = it.next();
-        if (it.next()) |_| return error.Duplicate;
-        return header;
-    }
-
-    pub fn findMany(hm: *const HeaderMap, name: []const u8) FindIterator {
-        return .{
-            .i = hm.trie,
-            .h = hash(name),
-            .name = name,
-            .trie = hm,
-        };
-    }
-
-    pub fn add(hm: *HeaderMap, name: []const u8, value: []const u8) error{OutOfMemory}!void {
-        const entry_new_index: Index = @enumFromInt(@as(u16, @intCast(hm.trie_storage.len)));
-        const entry_new = hm.trie_storage.addOne() catch return error.OutOfMemory;
-        entry_new.* = .{ .header = .{ .name = name, .value = value } };
-
-        var l: *Index = &hm.trie;
-        var h = hash(name);
-        while (l.* != .empty) : (h >>= 2) l = &hm.entry(l.*).child[h & 0b11];
-        l.* = entry_new_index;
-    }
-
-    pub const FindIterator = struct {
-        i: Index,
-        h: u64,
-        name: []const u8,
-        trie: *const HeaderMap,
-
-        pub fn next(it: *FindIterator) ?Header {
-            // We look up in the same way we add a new entry, which means we preserve insertion order.
-            return while (it.i != .empty) {
-                const ent = it.trie.entryConst(it.i);
-                defer {
-                    it.i = ent.child[it.h & 0b11];
-                    it.h >>= 2;
+        pub fn get(smap: ReifyConst, key: []const u8) ?KV {
+            return for (smap.smap) |e| {
+                const k = e.k.reifyConst(smap.data);
+                if (std.mem.eql(u8, k, key)) {
+                    const v = e.v.reifyConst(smap.data);
+                    break .{ .k = k, .v = v };
                 }
-                if (!eql(it.name, ent.header.name)) continue;
-                break ent.header;
             } else null;
         }
-    };
 
-    pub fn iterator(hm: *const HeaderMap) Iterator {
-        return .{ .i = 0, .entries = hm.trie_storage.constSlice() };
-    }
-
-    pub const Iterator = struct {
-        i: usize,
-        entries: []const Entry,
-
-        pub fn next(it: *Iterator) ?Header {
-            return while (it.i < it.entries.len) {
-                defer it.i += 1;
-                break it.entries[it.i].header;
-            } else null;
+        pub fn iterate(smap: ReifyConst) Iterator {
+            return .{ .idx = 0, .buf = smap.smap, .data = smap.data };
         }
+
+        pub const Iterator = struct {
+            idx: usize,
+            buf: []const Entry,
+            data: []const u8,
+
+            pub fn next(it: *Iterator) ?KV {
+                return while (it.idx < it.buf.len) {
+                    defer it.idx += 1;
+                    break it.buf[it.idx].reifyConst(it.data);
+                } else return null;
+            }
+        };
     };
-
-    inline fn entry(hm: *HeaderMap, index: Index) *Entry {
-        assert(index != .empty);
-        return &hm.trie_storage.slice()[@intFromEnum(index)];
-    }
-    inline fn entryConst(hm: *const HeaderMap, index: Index) *const Entry {
-        assert(index != .empty);
-        return &hm.trie_storage.constSlice()[@intFromEnum(index)];
-    }
-
-    fn hash(s: []const u8) u64 {
-        var hasher = std.hash.Wyhash.init(0); // TODO: seed
-        hasher.update(s);
-        return hasher.final();
-    }
-
-    fn eql(lhs: []const u8, rhs: []const u8) bool {
-        return std.mem.eql(u8, lhs, rhs);
-    }
-
-    test {
-        var hm: HeaderMap = .{};
-
-        try testing.expectEqual(@as(?Header, null), hm.find("accept-encoding"));
-
-        try hm.add("accept-encoding", "gzip");
-        try testing.expectEqualDeep(@as(?Header, .{ .name = "accept-encoding", .value = "gzip" }), hm.find("accept-encoding"));
-    }
 };

@@ -37,13 +37,13 @@ pub fn StateMachine(
         pub fn process(sm: *@This(), ctx: Context, data: []u8) !usize {
             return switch (sm.*) {
                 .headers => blk_headers: {
-                    var req: Request = undefined;
-                    const consumed = try parseRequestLineAndHeaders(&req, data);
+                    var req_headers: [constants.http1_headers_count_max]Request.StringKeyValue.Entry = undefined;
+                    var req: Request, const consumed: usize = try parseRequestLineAndHeaders(data, &req_headers);
 
-                    const transfer_encoding = getTransferEncoding(&req.headers) catch {
+                    const transfer_encoding = getTransferEncoding(req.headers()) catch {
                         return error.InvalidFraming;
                     };
-                    const content_length = getContentLength(&req.headers) catch {
+                    const content_length = getContentLength(req.headers()) catch {
                         return error.InvalidFraming;
                     };
 
@@ -150,10 +150,10 @@ test StateMachine {
     }
 }
 
-fn getTransferEncoding(hm: *const Request.HeaderMap) error{Invalid}!?TransferEncoding {
+fn getTransferEncoding(hm: Request.StringKeyValue.ReifyConst) error{Invalid}!?TransferEncoding {
     // TODO: get transfer-encoding stack and verify that the last coding is chunked (RFC9112 section 6.1)
-    const h = (hm.findSingle("transfer-encoding") catch return error.Invalid) orelse return null;
-    return if (std.mem.eql(u8, std.mem.trim(u8, h.value, " \t"), "chunked"))
+    const h = hm.get("transfer-encoding") orelse return null;
+    return if (std.mem.eql(u8, std.mem.trim(u8, h.v, " \t"), "chunked"))
         .chunked
     else
         return error.Invalid;
@@ -164,67 +164,76 @@ const TransferEncoding = enum {
     // TODO: gzip?
 };
 
-fn getContentLength(hm: *const Request.HeaderMap) error{Invalid}!?u64 {
-    const h = (hm.findSingle("content-length") catch return error.Invalid) orelse return null;
-    return std.fmt.parseUnsigned(u64, h.value, 10) catch error.Invalid;
+fn getContentLength(hm: Request.StringKeyValue.ReifyConst) error{Invalid}!?u64 {
+    const h = hm.get("content-length") orelse return null;
+    return std.fmt.parseUnsigned(u64, h.v, 10) catch error.Invalid;
 }
 
-fn parseRequestLineAndHeaders(req: *Request, data: []u8) !usize {
+fn parseRequestLineAndHeaders(data: []u8, headers_storage: []Request.StringKeyValue.Entry) !struct { Request, usize } {
     assert(data.len > 0);
 
-    req.headers = .{};
-
     var p: RequestParser = .{
-        .req = req,
         .data = data,
         .curr = 0,
     };
 
-    try p.parseRequestLine();
-    while (try p.parseRequestHeader()) {}
-    return p.curr;
+    const method = try p.parseMethod();
+    const path = try p.parsePath();
+    const version = try p.parseVersion();
+    if (!std.mem.eql(u8, p.advance(2), "\r\n")) return error.InvalidToken;
+
+    var headers = std.ArrayListUnmanaged(Request.StringKeyValue.Entry).initBuffer(headers_storage);
+    while (try p.parseField()) |hdr| {
+        if (headers.items.len == headers.capacity) return error.OutOfSpace;
+        headers.appendAssumeCapacity(hdr);
+    }
+
+    return .{ .{
+        .data = p.data[0..p.curr],
+
+        ._method = method,
+        ._path = path,
+        ._version = version,
+        ._headers = .{ .buf = headers.items },
+    }, p.curr };
 }
 
 const RequestParser = struct {
-    req: *Request,
     data: []u8,
     curr: u32,
 
-    fn parseRequestLine(p: *RequestParser) !void {
-        { // -- method
-            const sp_off: u32 = for (p.data[p.curr..], 0..) |ch, i| {
-                if (!isMethodChar(ch)) {
-                    if (ch != ' ') return error.InvalidToken;
-                    break @intCast(i);
-                }
-            } else return error.NeedMore;
-            p.req._method = p.advanceByteSlice(sp_off + 1).sub(0, sp_off);
-        }
-
-        { // -- path
-            const sp_off: u32 = for (p.data[p.curr..], 0..) |ch, i| {
-                if (!isPathChar(ch)) {
-                    if (ch != ' ') return error.InvalidToken;
-                    break @intCast(i);
-                }
-            } else return error.NeedMore;
-            p.req._path = p.advanceByteSlice(sp_off + 1).sub(0, sp_off);
-        }
-
-        { // -- version
-            const version = "HTTP/1.1";
-            if (p.remainingLen() < version.len + 2) return error.NeedMore;
-            if (!std.mem.eql(u8, p.advance(version.len), version)) return error.InvalidVersion;
-            p.req._version = .@"1.1";
-            if (!std.mem.eql(u8, p.advance(2), "\r\n")) return error.InvalidToken;
-        }
+    fn parseMethod(p: *RequestParser) !Request.ByteSlice {
+        const sp_off: u32 = for (p.data[p.curr..], 0..) |ch, i| {
+            if (!isMethodChar(ch)) {
+                if (ch != ' ') return error.InvalidToken;
+                break @intCast(i);
+            }
+        } else return error.NeedMore;
+        return p.advanceByteSlice(sp_off + 1).sub(0, sp_off);
     }
 
-    fn parseRequestHeader(p: *RequestParser) !bool {
+    fn parsePath(p: *RequestParser) !Request.ByteSlice {
+        const sp_off: u32 = for (p.data[p.curr..], 0..) |ch, i| {
+            if (!isPathChar(ch)) {
+                if (ch != ' ') return error.InvalidToken;
+                break @intCast(i);
+            }
+        } else return error.NeedMore;
+        return p.advanceByteSlice(sp_off + 1).sub(0, sp_off);
+    }
+
+    fn parseVersion(p: *RequestParser) !Request.Version {
+        const version_string = "HTTP/1.1";
+        if (p.remainingLen() < version_string.len + 2) return error.NeedMore;
+        if (!std.mem.eql(u8, p.advance(version_string.len), version_string)) return error.InvalidVersion;
+        return .@"1.1";
+    }
+
+    fn parseField(p: *RequestParser) !?Request.StringKeyValue.Entry {
         if (p.remainingLen() < 2) return error.NeedMore;
         if (p.data[p.curr] == '\r' and p.data[p.curr + 1] == '\n') {
             _ = p.advance(2);
-            return false;
+            return null;
         }
 
         const name = blk_name: {
@@ -235,7 +244,7 @@ const RequestParser = struct {
                     break @intCast(i);
                 }
             } else return error.NeedMore;
-            break :blk_name p.advance(sep_off + 1)[0..sep_off];
+            break :blk_name p.advanceByteSlice(sep_off + 1).sub(0, @intCast(sep_off));
         };
 
         const value = blk_value: {
@@ -246,15 +255,14 @@ const RequestParser = struct {
                 if (ch == '\r') break @intCast(i);
             } else return error.NeedMore;
 
-            break :blk_value p.advance(delim_off);
+            break :blk_value p.advanceByteSlice(delim_off);
         };
 
         if (p.remainingLen() < 2) return error.NeedMore;
         if (p.data[p.curr] != '\r' or p.data[p.curr + 1] != '\n') return error.InvalidToken;
         _ = p.advance(2);
 
-        p.req.headers.add(name, value) catch return error.TooManyHeaders;
-        return true;
+        return .{ .k = name, .v = value };
     }
 
     inline fn advance(p: *RequestParser, n: u32) []u8 {
